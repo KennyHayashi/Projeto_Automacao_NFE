@@ -1,0 +1,194 @@
+import json
+import re
+import requests
+from odoo import api, exceptions, fields, models
+
+
+class StockPickingCustom(models.Model):
+    _inherit = 'stock.picking'
+
+    # =========================================================================
+    # CAMPOS CUSTOMIZADOS (ABAS 'TRANSPORTE' E 'CLIENTE E ENDEREÇO')
+    # =========================================================================
+    numero_nota_fiscal = fields.Char(
+        string="Número da Nota Fiscal", 
+        readonly=True, 
+        copy=False
+    )
+    data_envio = fields.Datetime(
+        string="Data de Envio", 
+        readonly=True, 
+        copy=False
+    )
+    custo_frete = fields.Float(
+        string="Custo do Frete", 
+        default=0.00, 
+        readonly=True
+    )
+    omie_nfe_status = fields.Char(
+        string="Status NF-e Omie", 
+        readonly=True, 
+        copy=False
+    )
+
+    # =========================================================================
+    # CONFIGURAÇÕES DA API OMIE (SUBSTITUA PELAS SUAS CREDENCIAIS)
+    # =========================================================================
+    OMIE_APP_KEY = "SEU_APP_KEY"
+    OMIE_APP_SECRET = "SEU_APP_SECRET"
+    OMIE_CENARIO_IMPOSTOS = "SEU_CODIGO_CENARIO"
+
+    # =========================================================================
+    # AÇÃO PRINCIPAL DO BOTÃO
+    # =========================================================================
+    def action_gerar_nfe_omie(self):
+        self.ensure_one()
+
+        # 1. VALIDAÇÃO DA TRANSPORTADORA
+        if not self.carrier_id:
+            raise exceptions.UserError(
+                "Selecione uma Transportadora antes de gerar a NF-e."
+            )
+
+        # 2. VALIDAÇÃO DO CNPJ/CPF DO CLIENTE
+        if not self.partner_id or not self.partner_id.vat:
+            raise exceptions.UserError(
+                "O cliente associado não possui CNPJ/CPF cadastrado."
+            )
+
+        cnpj_limpo = re.sub(r"\D", "", self.partner_id.vat)
+
+        # 3. CONSULTA DO CLIENTE NO OMIE E VALIDAÇÃO DE ENDEREÇO
+        omie_client = self._consultar_cliente_omie(cnpj_limpo)
+
+        if not omie_client:
+            raise exceptions.UserError(
+                f"O CNPJ/CPF {self.partner_id.vat} não está cadastrado no OMIE.\n"
+                "Solicite a criação deste cadastro SEDE/LOCAL na plataforma OMIE."
+            )
+
+        self._validar_endereco_omie(omie_client)
+
+        # 4. MONTAGEM DOS ITENS DO PEDIDO
+        linhas_itens = self.move_ids_without_package or self.move_line_ids
+        if not linhas_itens:
+            raise exceptions.UserError(
+                "Não há itens/produtos associados para a geração da nota."
+            )
+
+        itens_payload = []
+        for line in linhas_itens:
+            qtd = getattr(line, 'qty_done', 0.0) or getattr(line, 'product_uom_qty', 0.0)
+            itens_payload.append({
+                "ide": {"codigo_item_integracao": str(line.id)},
+                "produto": {
+                    "codigo_produto_integracao": line.product_id.default_code or str(line.product_id.id),
+                    "descricao": line.product_id.name,
+                    "quantidade": qtd,
+                    "valor_unitario": line.product_id.lst_price,
+                }
+            })
+
+        # 5. MONTAGEM DO PAYLOAD JSON DA API OMIE
+        payload = {
+            "call": "IncluirPedido",
+            "app_key": self.OMIE_APP_KEY,
+            "app_secret": self.OMIE_APP_SECRET,
+            "param": [{
+                "cabecalho": {
+                    "codigo_cliente_omie": omie_client.get("codigo_cliente_omie"),
+                    "codigo_cenario_impostos": self.OMIE_CENARIO_IMPOSTOS,
+                    "etapa": "10"  # Faturamento
+                },
+                "frete": {
+                    "modalidade_frete": "0",  # 0 = CIF (Remetente/Acomodado)
+                    "valor_frete": 0.00,
+                    "codigo_trasportadora": str(self.carrier_id.id)
+                },
+                "det": itens_payload
+            }]
+        }
+
+        # 6. REQUISIÇÃO HTTP PARA A API DO OMIE
+        url = "https://app.omie.com.br/api/v1/produtos/pedido/"
+        headers = {"Content-Type": "application/json"}
+
+        try:
+            response = requests.post(url, data=json.dumps(payload), headers=headers, timeout=30)
+            res_data = response.json()
+        except requests.exceptions.RequestException as e:
+            raise exceptions.UserError(f"Falha de conexão com a API do Omie: {e}")
+
+        # 7. TRATAMENTO DA RESPOSTA E ATUALIZAÇÃO DOS CAMPOS
+        if response.status_code == 200 and "numero_pedido" in res_data:
+            numero_nf = str(res_data.get("numero_pedido"))
+            codigo_pedido = res_data.get("codigo_pedido")
+
+            self.write({
+                'numero_nota_fiscal': numero_nf,
+                'data_envio': fields.Datetime.now(),
+                'custo_frete': 0.00,
+                'omie_nfe_status': f"Sucesso! Pedido OMIE ID: {codigo_pedido}"
+            })
+        else:
+            erro_msg = res_data.get("faultstring", "Erro desconhecido retornado pela API do Omie.")
+            raise exceptions.UserError(f"Erro ao emitir NF-e no Omie:\n{erro_msg}")
+
+    # =========================================================================
+    # MÉTODOS AUXILIARES DE SUPORTE
+    # =========================================================================
+    def _consultar_cliente_omie(self, cnpj_cpf):
+        """Consulta o cadastro do cliente via API do Omie usando o CNPJ/CPF."""
+        url = "https://app.omie.com.br/api/v1/geral/clientes/"
+        payload = {
+            "call": "PesquisarClientes",
+            "app_key": self.OMIE_APP_KEY,
+            "app_secret": self.OMIE_APP_SECRET,
+            "param": [{
+                "clientesFiltro": {
+                    "cnpj_cpf": cnpj_cpf
+                }
+            }]
+        }
+        headers = {"Content-Type": "application/json"}
+
+        try:
+            res = requests.post(url, data=json.dumps(payload), headers=headers, timeout=15)
+            if res.status_code == 200:
+                data = res.json()
+                clientes = data.get("clientes_cadastro", [])
+                return clientes[0] if clientes else None
+        except requests.exceptions.RequestException:
+            pass
+
+        return None
+
+    def _validar_endereco_omie(self, omie_client):
+        """Compara o CEP e logradouro do Odoo com o cadastro retornado do Omie."""
+        cep_odoo = re.sub(r"\D", "", self.partner_id.zip or "")
+        cep_omie = re.sub(r"\D", "", omie_client.get("cep", ""))
+
+        rua_odoo = (self.partner_id.street or "").strip().lower()
+        rua_omie = (omie_client.get("endereco", "")).strip().lower()
+
+        if cep_odoo != cep_omie or (rua_odoo not in rua_omie and rua_omie not in rua_odoo):
+            raise exceptions.UserError(
+                "Os dados de endereço no Odoo não coincidem com o cadastro ativo no OMIE!\n\n"
+                f"• Endereço Odoo: {self.partner_id.street}, CEP: {self.partner_id.zip}\n"
+                f"• Endereço OMIE: {omie_client.get('endereco')}, CEP: {omie_client.get('cep')}\n\n"
+                "Por favor, atualize o cadastro SEDE/LOCAL no OMIE antes de prosseguir."
+            )
+
+
+# =============================================================================
+# ESTRUTURA XML VIEW (Para inclusão na view do Odoo)
+# =============================================================================
+"""
+<xpath expr="//header" position="inside">
+    <button name="action_gerar_nfe_omie"
+            string="Gerar NF-e Omie"
+            type="object"
+            class="btn-primary"
+            invisible="not carrier_id"/>
+</xpath>
+"""
