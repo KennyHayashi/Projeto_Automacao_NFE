@@ -10,20 +10,40 @@ class StockPickingCustom(models.Model):
     # =========================================================================
     # CAMPOS CUSTOMIZADOS E MAPEADOS (CONFORME ODOO)
     # =========================================================================
+    #
+    # IMPORTANTE:
+    # Este modelo representa individualmente cada Pedido de Envio / Entrega
+    # existente no Odoo.
+    #
+    # Exemplo:
+    #
+    # Entrega nº 75236
+    #
+    # Quando o usuário estiver dentro dessa entrega e clicar no botão
+    # "Emitir NF-e", o método action_gerar_nfe_omie() será executado
+    # diretamente sobre ESTE registro.
+    #
+    # Portanto:
+    #
+    # self = Entrega/Pedido de Envio atual
+    #
+    # Não é necessário procurar o Ticket/Entrega novamente.
+    #
+
     numero_nota_fiscal = fields.Char(
         string="Número da Nota Fiscal",
         readonly=True,
         copy=False
     )
 
-    # Campo nativo/customizado mapeado 
+    # Campo nativo/customizado mapeado
     shipping_date = fields.Datetime(
         string="Data de Envio",
         readonly=True,
         copy=False
     )
 
-    # Campo nativo/customizado mapeado 
+    # Campo nativo/customizado mapeado
     expected_receipt_date = fields.Datetime(
         string="Previsão de Recebimento",
         readonly=True,
@@ -45,45 +65,110 @@ class StockPickingCustom(models.Model):
     # =========================================================================
     # CREDENCIAIS OMIE
     # =========================================================================
+    #
+    # MOLDE:
+    # As credenciais NÃO devem ficar diretamente no código em produção.
+    #
+    # O ideal é armazená-las em configuração segura do Odoo.
+    #
+
     OMIE_APP_KEY = "SEU_APP_KEY"
     OMIE_APP_SECRET = "SEU_APP_SECRET"
 
     # O Cenário de Impostos no Omie deve estar previamente configurado com:
     # CST 90, IPI 53, PIS/COFINS 08, ICMS ST (Não calcular)
     # e Base (Valor da Operação)
+
     OMIE_CENARIO_COMODATO = "SEU_CODIGO_CENARIO_COMODATO"
 
     # =========================================================================
     # AÇÃO PRINCIPAL DO BOTÃO
     # =========================================================================
+    #
+    # Este método será associado ao botão que será inserido na tela
+    # individual de cada Pedido de Envio / Entrega do Odoo.
+    #
+    # Exemplo:
+    #
+    # Usuário está em:
+    #
+    #     Entrega nº 75236
+    #
+    # Clica:
+    #
+    #     [ EMITIR NF-e ]
+    #
+    # Então:
+    #
+    #     self = stock.picking correspondente à Entrega nº 75236
+    #
+    # Todo o processo abaixo utilizará os dados dessa entrega específica.
+    #
+
     def action_gerar_nfe_omie(self):
         self.ensure_one()
 
         # =====================================================================
-        # 1. PROTEÇÃO CONTRA DUPLICIDADE
+        # 1. IDENTIFICAÇÃO DO PEDIDO DE ENVIO ATUAL
         # =====================================================================
         #
-        # Impede que o mesmo Ticket/Picking seja enviado novamente ao Omie
-        # caso o processo de faturamento já tenha sido iniciado.
+        # O registro atual é a própria entrega/pedido de envio que acionou
+        # o botão.
+        #
+        # Não é necessário receber o ID por parâmetro nem pesquisar outra
+        # entrega.
+        #
+        # Exemplo:
+        #
+        # self.id       -> ID interno da Entrega
+        # self.name      -> número/referência da Entrega
         #
         # MOLDE:
-        # Na implementação definitiva, recomenda-se utilizar um campo
-        # específico para armazenar o código do Pedido Omie.
+        # Os campos exatos podem ser ajustados conforme a configuração
+        # definitiva do Odoo.
         #
+
+        envio_id = self.id
+        envio_referencia = self.name
+
+        # =====================================================================
+        # 2. PROTEÇÃO CONTRA DUPLICIDADE
+        # =====================================================================
+        #
+        # Impede que o mesmo Pedido de Envio seja enviado novamente ao Omie
+        # caso o processo de faturamento já tenha sido iniciado.
+        #
+        # IMPORTANTE:
+        # Na implementação definitiva, recomenda-se possuir campos separados
+        # para:
+        #
+        # - Código do Pedido Omie
+        # - Número do Pedido Omie
+        # - Número da NF-e
+        # - Chave da NF-e
+        # - Status da NF-e
+        #
+        # Aqui permanece simplificado porque este código é um MOLDE.
+        #
+
         if self.omie_nfe_status and (
             "PEDIDO_CRIADO" in self.omie_nfe_status
             or "FATURAMENTO_SOLICITADO" in self.omie_nfe_status
             or "AUTORIZADA" in self.omie_nfe_status
         ):
             raise exceptions.UserError(
-                "Este registro já possui uma operação de faturamento "
-                "iniciada no Omie.\n\n"
+                "Este Pedido de Envio já possui uma operação "
+                "de faturamento iniciada no Omie.\n\n"
+                f"Entrega: {envio_referencia}\n"
                 f"Status atual: {self.omie_nfe_status}"
             )
 
         # =====================================================================
-        # 2. VALIDAÇÃO DA TRANSPORTADORA
+        # 3. VALIDAÇÃO DA TRANSPORTADORA
         # =====================================================================
+        #
+        # Os dados são obtidos diretamente da Entrega/Pedido de Envio atual.
+        #
 
         if not self.carrier:
             raise exceptions.UserError(
@@ -91,12 +176,16 @@ class StockPickingCustom(models.Model):
             )
 
         # =====================================================================
-        # 3. VALIDAÇÃO DO CLIENTE E CONSULTA OMIE
+        # 4. VALIDAÇÃO DO CLIENTE E CONSULTA OMIE
         # =====================================================================
+        #
+        # O cliente também pertence à Entrega/Pedido de Envio atual.
+        #
 
         if not self.partner_id or not self.partner_id.vat:
             raise exceptions.UserError(
-                "O cliente associado não possui CNPJ/CPF cadastrado."
+                "O cliente associado a este Pedido de Envio "
+                "não possui CNPJ/CPF cadastrado."
             )
 
         cnpj_limpo = re.sub(
@@ -105,6 +194,7 @@ class StockPickingCustom(models.Model):
             self.partner_id.vat
         )
 
+        # Consulta o cadastro correspondente no Omie.
         omie_client = self._consultar_cliente_omie(
             cnpj_limpo
         )
@@ -112,13 +202,13 @@ class StockPickingCustom(models.Model):
         if not omie_client:
             raise exceptions.UserError(
                 f"O CNPJ/CPF {self.partner_id.vat} "
-                "não está cadastrado no OMIE.\n"
+                "não está cadastrado no OMIE.\n\n"
                 "Solicite a criação deste cadastro SEDE/LOCAL "
                 "na plataforma OMIE antes do faturamento."
             )
 
         # =====================================================================
-        # 4. VALIDAÇÃO DO ENDEREÇO
+        # 5. VALIDAÇÃO DO ENDEREÇO
         # =====================================================================
 
         self._validar_endereco_omie(
@@ -126,9 +216,25 @@ class StockPickingCustom(models.Model):
         )
 
         # =====================================================================
-        # 5. REGRA DE NEGÓCIO DA DEMANDA
+        # 6. REGRA DE NEGÓCIO DOS PRODUTOS DO PEDIDO DE ENVIO
         #    UNIDADE ELETRÔNICA VS CHICOTE
         # =====================================================================
+        #
+        # Os produtos utilizados na emissão são aqueles pertencentes
+        # diretamente à Entrega/Pedido de Envio que acionou o botão.
+        #
+        # Exemplo:
+        #
+        # Entrega nº 75236
+        #
+        # Produtos:
+        #
+        # - UNIDADES ELETRÔNICAS
+        # - GOBO008...
+        # - GOBO003...
+        #
+        # Portanto, a integração utiliza as linhas desta entrega.
+        #
 
         linhas_itens = (
             self.move_ids_without_package
@@ -138,7 +244,7 @@ class StockPickingCustom(models.Model):
         if not linhas_itens:
             raise exceptions.UserError(
                 "Não há itens/produtos associados "
-                "para a geração da nota."
+                "a este Pedido de Envio para a geração da nota."
             )
 
         qtd_unidades = 0.0
@@ -160,7 +266,7 @@ class StockPickingCustom(models.Model):
             )
 
             # Identifica se a linha é um Chicote
-            # pelo prefixo GOB
+            # pelo nome ou prefixo GOB.
             if (
                 "CHICOTE" in nome_produto
                 or "GOB-" in sku_produto
@@ -168,11 +274,11 @@ class StockPickingCustom(models.Model):
                 qtd_chicotes += qtd
 
             else:
-                # Caso contrário, considera Unidade Eletrônica (U.E)
+                # Caso contrário, considera Unidade Eletrônica (U.E).
                 qtd_unidades += qtd
 
         # =====================================================================
-        # 6. DEFINE QUANTIDADE, DESCRIÇÃO E PESO
+        # 7. DEFINE QUANTIDADE, DESCRIÇÃO E PESO
         # =====================================================================
 
         if qtd_unidades > 0:
@@ -180,11 +286,11 @@ class StockPickingCustom(models.Model):
             qtd_faturar = qtd_unidades
 
             descricao_item = (
-                "APARELHO DE RADIONAVEGAÇÃO P/ "
+                "APARELHO DE RADIONAVEGAÇÃO CENTRAL DE TELEMETRIA, RADIONAVEGAÇÃO"
                 "UNIDADES ELETRÔNICAS + CHICOTE"
             )
 
-            # 300g por Unidade Eletrônica + Chicote
+            # 300g por Unidade Eletrônica + Chicote.
             peso_total = qtd_faturar * 0.300
 
         elif qtd_chicotes > 0:
@@ -192,21 +298,21 @@ class StockPickingCustom(models.Model):
             qtd_faturar = qtd_chicotes
 
             descricao_item = (
-                "CHICOTE P/ UNIDADE ELETRÔNICA"
+                "CHICOTE ELÉTRICO PARA VEÍCULOS AUTOMOTORES"
             )
 
-            # 200g por Chicote
+            # 200g por Chicote.
             peso_total = qtd_faturar * 0.200
 
         else:
 
             raise exceptions.UserError(
                 "Não foi possível identificar "
-                "Unidades ou Chicotes no pedido."
+                "Unidades ou Chicotes no Pedido de Envio."
             )
 
         # =====================================================================
-        # 7. REGRA DO CFOP
+        # 8. REGRA DO CFOP
         #    ESTADUAL VS INTERESTADUAL
         # =====================================================================
 
@@ -225,20 +331,29 @@ class StockPickingCustom(models.Model):
         )
 
         # =====================================================================
-        # 8. CRIA PEDIDO DE VENDA NO OMIE
+        # 9. CRIA PEDIDO DE VENDA NO OMIE
         # =====================================================================
         #
         # IMPORTANTE:
         #
-        # Esta etapa cria o Pedido de Venda.
+        # O Pedido de Venda será criado especificamente para esta Entrega.
         #
-        # Ela NÃO significa que a NF-e foi autorizada.
+        # Não é um pedido genérico.
         #
-        # Após criar o Pedido, será chamada a operação:
+        # O identificador de integração utilizará o ID da Entrega:
         #
-        #     FaturarPedidoVenda
+        #     ODOO-ENTREGA-75236
         #
-        # que inicia o processo de faturamento/emissão da NF-e.
+        # Isso permite rastrear:
+        #
+        # Odoo Entrega 75236
+        #        ↓
+        # Pedido Omie
+        #        ↓
+        # NF-e
+        #
+        # A criação do Pedido de Venda NÃO significa que a NF-e já foi
+        # autorizada.
         #
 
         pedido_omie = self._criar_pedido_venda_omie(
@@ -250,11 +365,11 @@ class StockPickingCustom(models.Model):
         )
 
         # =====================================================================
-        # 9. FATURA O PEDIDO DE VENDA
+        # 10. FATURA O PEDIDO DE VENDA
         # =====================================================================
         #
-        # Aqui o Pedido de Venda criado anteriormente é enviado para
-        # o processo de faturamento da NF-e.
+        # O Pedido de Venda criado especificamente para esta Entrega
+        # será enviado ao processo de faturamento do Omie.
         #
         # A autorização final da NF-e pela SEFAZ deverá ser obtida
         # posteriormente via webhook ou consulta de status.
@@ -265,8 +380,14 @@ class StockPickingCustom(models.Model):
         )
 
         # =====================================================================
-        # 10. RETORNO VISUAL PARA O USUÁRIO (FRONT)
+        # 11. RETORNO VISUAL PARA O USUÁRIO
         # =====================================================================
+        #
+        # Após o clique, o usuário permanece trabalhando sobre a Entrega
+        # atual.
+        #
+        # O Odoo informa que o processo foi iniciado.
+        #
 
         return {
             "type": "ir.actions.client",
@@ -274,6 +395,7 @@ class StockPickingCustom(models.Model):
             "params": {
                 "title": "NF-e enviada para faturamento",
                 "message": (
+                    f"A Entrega {envio_referencia} foi processada.\n\n"
                     "O Pedido de Venda foi criado e enviado "
                     "para faturamento no Omie.\n\n"
                     "A NF-e está aguardando processamento "
@@ -298,34 +420,48 @@ class StockPickingCustom(models.Model):
         peso_total
     ):
         """
-        Cria o Pedido de Venda no Omie.
+        Cria o Pedido de Venda no Omie referente à Entrega/Pedido de Envio
+        que acionou o botão.
 
         IMPORTANTE:
         O Pedido de Venda não deve ser confundido com a NF-e.
 
-        O fluxo será:
+        Fluxo:
 
-            Odoo
-              ↓
+            Entrega Odoo
+                  ↓
             IncluirPedido
-              ↓
+                  ↓
             Pedido Omie
-              ↓
+                  ↓
             FaturarPedidoVenda
-              ↓
-            NF-e
-              ↓
-            SEFAZ
+                  ↓
+                 NF-e
+                  ↓
+                SEFAZ
         """
 
         # =====================================================================
         # IDENTIFICADOR DA INTEGRAÇÃO
         # =====================================================================
         #
-        # Identificador único para rastrear a operação do Odoo no Omie.
+        # O ID utilizado é o da própria Entrega/Pedido de Envio.
+        #
+        # Exemplo:
+        #
+        # Entrega Odoo = 75236
+        #
+        # Identificador:
+        #
+        # ODOO-ENTREGA-75236
+        #
+        # Isso cria uma relação direta entre o registro do Odoo
+        # e o Pedido criado no Omie.
         #
 
-        codigo_integracao = f"ODOO-TICKET-{self.id}"
+        codigo_integracao = (
+            f"ODOO-ENTREGA-{self.id}"
+        )
 
         # =====================================================================
         # ITENS DO PEDIDO
@@ -343,11 +479,17 @@ class StockPickingCustom(models.Model):
                 # MOLDE:
                 # Substituir pelo código real do produto cadastrado no Omie.
                 #
-                # Exemplo:
-                # "codigo_produto": 123456
+                # Unidade Eletrônica ou Unidade Eletrônica + Chicote:
                 #
-                # Unidade Eletrônica ou Unidade Eltrônica + chicote: APARELHO DE RADIONAVEGAÇÃO CENTRAL DE TELEMETRIA, RADIONAVEGAÇÃO; 
-                # Chicote: CHICOTE ELÉTRICO PARA VEÍCULOS AUTOMOTORES; 
+                # APARELHO DE RADIONAVEGAÇÃO CENTRAL DE TELEMETRIA,
+                # RADIONAVEGAÇÃO
+                #
+                # Chicote:
+                #
+                # CHICOTE ELÉTRICO PARA VEÍCULOS AUTOMOTORES
+                #
+                # O código definitivo deverá ser definido conforme
+                # o cadastro de produtos no Omie.
 
                 "codigo_produto": 123456,
 
@@ -388,7 +530,7 @@ class StockPickingCustom(models.Model):
                         )
                     ),
 
-                    # Identificador do pedido no Odoo.
+                    # Identificador da Entrega/Pedido de Envio no Odoo.
                     #
                     # NÃO utilizar numero_pedido como número da NF.
                     "codigo_pedido_integracao": (
@@ -427,7 +569,8 @@ class StockPickingCustom(models.Model):
 
                     "dados_adicionais_nf": (
                         "Origem: Internacional. "
-                        "Operacao de Remessa em Comodato."
+                        "Operacao de Remessa em Comodato. "
+                        f"Entrega Odoo: {self.name}"
                     )
                 }
             }]
@@ -463,7 +606,7 @@ class StockPickingCustom(models.Model):
 
             raise exceptions.UserError(
                 "Falha de conexão com a API do Omie "
-                "ao criar o Pedido de Venda:\n\n"
+                "ao criar o Pedido de Venda para esta Entrega:\n\n"
                 f"{e}"
             )
 
@@ -498,10 +641,12 @@ class StockPickingCustom(models.Model):
         # ATUALIZA STATUS NO ODOO
         # =====================================================================
         #
-        # IMPORTANTE:
-        # Aqui NÃO gravamos numero_pedido como numero_nota_fiscal.
+        # Atualiza SOMENTE a Entrega/Pedido de Envio que acionou o botão.
         #
-        # O número recebido é o número do Pedido de Venda.
+        # Não existe alteração em outros pedidos.
+        #
+        # IMPORTANTE:
+        # numero_pedido NÃO é número da NF-e.
         #
 
         self.write({
@@ -536,11 +681,14 @@ class StockPickingCustom(models.Model):
         pedido_omie
     ):
         """
-        Solicita ao Omie o faturamento do Pedido de Venda.
+        Solicita ao Omie o faturamento do Pedido de Venda relacionado
+        à Entrega/Pedido de Envio atual.
 
         Fluxo:
 
-            Pedido de Venda
+            Entrega Odoo
+                  ↓
+            Pedido Omie
                   ↓
             FaturarPedidoVenda
                   ↓
@@ -696,6 +844,8 @@ class StockPickingCustom(models.Model):
         # NF-e autorizada     = AINDA NÃO NECESSARIAMENTE
         #
         # Por isso NÃO preenchemos numero_nota_fiscal aqui.
+        #
+        # Este status pertence somente à Entrega que acionou o botão.
         #
 
         self.write({
