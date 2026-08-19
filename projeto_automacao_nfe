@@ -8,35 +8,50 @@ class StockPickingCustom(models.Model):
     _inherit = 'stock.picking'
 
     # =========================================================================
-    # CAMPOS CUSTOMIZADOS (ABAS 'TRANSPORTE' E 'CLIENTE E ENDEREÇO')
+    # CAMPOS CUSTOMIZADOS E MAPEADOS (CONFORME ODOO)
     # =========================================================================
     numero_nota_fiscal = fields.Char(
-        string="Número da Nota Fiscal", 
-        readonly=True, 
+        string="Número da Nota Fiscal",
+        readonly=True,
         copy=False
     )
-    data_envio = fields.Datetime(
-        string="Data de Envio", 
-        readonly=True, 
+
+    # Campo nativo/customizado mapeado 
+    shipping_date = fields.Datetime(
+        string="Data de Envio",
+        readonly=True,
         copy=False
     )
+
+    # Campo nativo/customizado mapeado 
+    expected_receipt_date = fields.Datetime(
+        string="Previsão de Recebimento",
+        readonly=True,
+        copy=False
+    )
+
     custo_frete = fields.Float(
-        string="Custo do Frete", 
-        default=0.00, 
+        string="Custo do Frete",
+        default=0.00,
         readonly=True
     )
+
     omie_nfe_status = fields.Char(
-        string="Status NF-e Omie", 
-        readonly=True, 
+        string="Status NF-e Omie",
+        readonly=True,
         copy=False
     )
 
     # =========================================================================
-    # CONFIGURAÇÕES DA API OMIE (SUBSTITUA PELAS SUAS CREDENCIAIS)
+    # CREDENCIAIS OMIE
     # =========================================================================
     OMIE_APP_KEY = "SEU_APP_KEY"
     OMIE_APP_SECRET = "SEU_APP_SECRET"
-    OMIE_CENARIO_IMPOSTOS = "SEU_CODIGO_CENARIO"
+
+    # O Cenário de Impostos no Omie deve estar previamente configurado com:
+    # CST 90, IPI 53, PIS/COFINS 08, ICMS ST (Não calcular)
+    # e Base (Valor da Operação)
+    OMIE_CENARIO_COMODATO = "SEU_CODIGO_CENARIO_COMODATO"
 
     # =========================================================================
     # AÇÃO PRINCIPAL DO BOTÃO
@@ -44,151 +59,769 @@ class StockPickingCustom(models.Model):
     def action_gerar_nfe_omie(self):
         self.ensure_one()
 
-        # 1. VALIDAÇÃO DA TRANSPORTADORA
-        if not self.carrier_id:
+        # =====================================================================
+        # 1. PROTEÇÃO CONTRA DUPLICIDADE
+        # =====================================================================
+        #
+        # Impede que o mesmo Ticket/Picking seja enviado novamente ao Omie
+        # caso o processo de faturamento já tenha sido iniciado.
+        #
+        # MOLDE:
+        # Na implementação definitiva, recomenda-se utilizar um campo
+        # específico para armazenar o código do Pedido Omie.
+        #
+        if self.omie_nfe_status and (
+            "PEDIDO_CRIADO" in self.omie_nfe_status
+            or "FATURAMENTO_SOLICITADO" in self.omie_nfe_status
+            or "AUTORIZADA" in self.omie_nfe_status
+        ):
+            raise exceptions.UserError(
+                "Este registro já possui uma operação de faturamento "
+                "iniciada no Omie.\n\n"
+                f"Status atual: {self.omie_nfe_status}"
+            )
+
+        # =====================================================================
+        # 2. VALIDAÇÃO DA TRANSPORTADORA
+        # =====================================================================
+
+        if not self.carrier:
             raise exceptions.UserError(
                 "Selecione uma Transportadora antes de gerar a NF-e."
             )
 
-        # 2. VALIDAÇÃO DO CNPJ/CPF DO CLIENTE
+        # =====================================================================
+        # 3. VALIDAÇÃO DO CLIENTE E CONSULTA OMIE
+        # =====================================================================
+
         if not self.partner_id or not self.partner_id.vat:
             raise exceptions.UserError(
                 "O cliente associado não possui CNPJ/CPF cadastrado."
             )
 
-        cnpj_limpo = re.sub(r"\D", "", self.partner_id.vat)
+        cnpj_limpo = re.sub(
+            r"\D",
+            "",
+            self.partner_id.vat
+        )
 
-        # 3. CONSULTA DO CLIENTE NO OMIE E VALIDAÇÃO DE ENDEREÇO
-        omie_client = self._consultar_cliente_omie(cnpj_limpo)
+        omie_client = self._consultar_cliente_omie(
+            cnpj_limpo
+        )
 
         if not omie_client:
             raise exceptions.UserError(
-                f"O CNPJ/CPF {self.partner_id.vat} não está cadastrado no OMIE.\n"
-                "Solicite a criação deste cadastro SEDE/LOCAL na plataforma OMIE."
+                f"O CNPJ/CPF {self.partner_id.vat} "
+                "não está cadastrado no OMIE.\n"
+                "Solicite a criação deste cadastro SEDE/LOCAL "
+                "na plataforma OMIE antes do faturamento."
             )
 
-        self._validar_endereco_omie(omie_client)
+        # =====================================================================
+        # 4. VALIDAÇÃO DO ENDEREÇO
+        # =====================================================================
 
-        # 4. MONTAGEM DOS ITENS DO PEDIDO
-        linhas_itens = self.move_ids_without_package or self.move_line_ids
+        self._validar_endereco_omie(
+            omie_client
+        )
+
+        # =====================================================================
+        # 5. REGRA DE NEGÓCIO DA DEMANDA
+        #    UNIDADE ELETRÔNICA VS CHICOTE
+        # =====================================================================
+
+        linhas_itens = (
+            self.move_ids_without_package
+            or self.move_line_ids
+        )
+
         if not linhas_itens:
             raise exceptions.UserError(
-                "Não há itens/produtos associados para a geração da nota."
+                "Não há itens/produtos associados "
+                "para a geração da nota."
             )
 
-        itens_payload = []
-        for line in linhas_itens:
-            qtd = getattr(line, 'qty_done', 0.0) or getattr(line, 'product_uom_qty', 0.0)
-            itens_payload.append({
-                "ide": {"codigo_item_integracao": str(line.id)},
-                "produto": {
-                    "codigo_produto_integracao": line.product_id.default_code or str(line.product_id.id),
-                    "descricao": line.product_id.name,
-                    "quantidade": qtd,
-                    "valor_unitario": line.product_id.lst_price,
-                }
-            })
+        qtd_unidades = 0.0
+        qtd_chicotes = 0.0
 
-        # 5. MONTAGEM DO PAYLOAD JSON DA API OMIE
+        for line in linhas_itens:
+
+            nome_produto = (
+                line.product_id.name or ""
+            ).upper()
+
+            sku_produto = (
+                line.product_id.default_code or ""
+            ).upper()
+
+            qtd = (
+                getattr(line, 'qty_done', 0.0)
+                or getattr(line, 'product_uom_qty', 0.0)
+            )
+
+            # Identifica se a linha é um Chicote
+            # pelo prefixo GOB
+            if (
+                "CHICOTE" in nome_produto
+                or "GOB-" in sku_produto
+            ):
+                qtd_chicotes += qtd
+
+            else:
+                # Caso contrário, considera Unidade Eletrônica (U.E)
+                qtd_unidades += qtd
+
+        # =====================================================================
+        # 6. DEFINE QUANTIDADE, DESCRIÇÃO E PESO
+        # =====================================================================
+
+        if qtd_unidades > 0:
+
+            qtd_faturar = qtd_unidades
+
+            descricao_item = (
+                "APARELHO DE RADIONAVEGAÇÃO P/ "
+                "UNIDADES ELETRÔNICAS + CHICOTE"
+            )
+
+            # 300g por Unidade Eletrônica + Chicote
+            peso_total = qtd_faturar * 0.300
+
+        elif qtd_chicotes > 0:
+
+            qtd_faturar = qtd_chicotes
+
+            descricao_item = (
+                "CHICOTE P/ UNIDADE ELETRÔNICA"
+            )
+
+            # 200g por Chicote
+            peso_total = qtd_faturar * 0.200
+
+        else:
+
+            raise exceptions.UserError(
+                "Não foi possível identificar "
+                "Unidades ou Chicotes no pedido."
+            )
+
+        # =====================================================================
+        # 7. REGRA DO CFOP
+        #    ESTADUAL VS INTERESTADUAL
+        # =====================================================================
+
+        estado_empresa = (
+            self.company_id.state_id.code
+        )
+
+        estado_cliente = (
+            self.partner_id.state_id.code
+        )
+
+        cfop_usado = (
+            "5.908"
+            if estado_empresa == estado_cliente
+            else "6.908"
+        )
+
+        # =====================================================================
+        # 8. CRIA PEDIDO DE VENDA NO OMIE
+        # =====================================================================
+        #
+        # IMPORTANTE:
+        #
+        # Esta etapa cria o Pedido de Venda.
+        #
+        # Ela NÃO significa que a NF-e foi autorizada.
+        #
+        # Após criar o Pedido, será chamada a operação:
+        #
+        #     FaturarPedidoVenda
+        #
+        # que inicia o processo de faturamento/emissão da NF-e.
+        #
+
+        pedido_omie = self._criar_pedido_venda_omie(
+            omie_client=omie_client,
+            qtd_faturar=qtd_faturar,
+            descricao_item=descricao_item,
+            cfop_usado=cfop_usado,
+            peso_total=peso_total
+        )
+
+        # =====================================================================
+        # 9. FATURA O PEDIDO DE VENDA
+        # =====================================================================
+        #
+        # Aqui o Pedido de Venda criado anteriormente é enviado para
+        # o processo de faturamento da NF-e.
+        #
+        # A autorização final da NF-e pela SEFAZ deverá ser obtida
+        # posteriormente via webhook ou consulta de status.
+        #
+
+        self._faturar_pedido_venda_omie(
+            pedido_omie
+        )
+
+        # =====================================================================
+        # 10. RETORNO VISUAL PARA O USUÁRIO (FRONT)
+        # =====================================================================
+
+        return {
+            "type": "ir.actions.client",
+            "tag": "display_notification",
+            "params": {
+                "title": "NF-e enviada para faturamento",
+                "message": (
+                    "O Pedido de Venda foi criado e enviado "
+                    "para faturamento no Omie.\n\n"
+                    "A NF-e está aguardando processamento "
+                    "e autorização da SEFAZ."
+                ),
+                "type": "success",
+                "sticky": False,
+            }
+        }
+
+    # =========================================================================
+    # MÉTODO AUXILIAR
+    # CRIAÇÃO DO PEDIDO DE VENDA NO OMIE
+    # =========================================================================
+
+    def _criar_pedido_venda_omie(
+        self,
+        omie_client,
+        qtd_faturar,
+        descricao_item,
+        cfop_usado,
+        peso_total
+    ):
+        """
+        Cria o Pedido de Venda no Omie.
+
+        IMPORTANTE:
+        O Pedido de Venda não deve ser confundido com a NF-e.
+
+        O fluxo será:
+
+            Odoo
+              ↓
+            IncluirPedido
+              ↓
+            Pedido Omie
+              ↓
+            FaturarPedidoVenda
+              ↓
+            NF-e
+              ↓
+            SEFAZ
+        """
+
+        # =====================================================================
+        # IDENTIFICADOR DA INTEGRAÇÃO
+        # =====================================================================
+        #
+        # Identificador único para rastrear a operação do Odoo no Omie.
+        #
+
+        codigo_integracao = f"ODOO-TICKET-{self.id}"
+
+        # =====================================================================
+        # ITENS DO PEDIDO
+        # =====================================================================
+
+        itens_payload = [{
+            "ide": {
+                "codigo_item_integracao": (
+                    f"{codigo_integracao}-ITEM-1"
+                )
+            },
+
+            "produto": {
+
+                # MOLDE:
+                # Substituir pelo código real do produto cadastrado no Omie.
+                #
+                # Exemplo:
+                # "codigo_produto": 123456
+                #
+                # Unidade Eletrônica ou Unidade Eltrônica + chicote: APARELHO DE RADIONAVEGAÇÃO CENTRAL DE TELEMETRIA, RADIONAVEGAÇÃO; 
+                # Chicote: CHICOTE ELÉTRICO PARA VEÍCULOS AUTOMOTORES; 
+
+                "codigo_produto": 123456,
+
+                "descricao": descricao_item,
+
+                "quantidade": qtd_faturar,
+
+                # Regra do exemplo:
+                # R$ 1,00 por unidade.
+                "valor_unitario": 1.00,
+
+                "cfop": cfop_usado
+
+                # MOLDE:
+                # NCM, origem e demais informações fiscais podem ser
+                # adicionados conforme o cadastro fiscal definido no Omie.
+            }
+        }]
+
+        # =====================================================================
+        # PAYLOAD DO PEDIDO DE VENDA
+        # =====================================================================
+
         payload = {
             "call": "IncluirPedido",
+
             "app_key": self.OMIE_APP_KEY,
+
             "app_secret": self.OMIE_APP_SECRET,
+
             "param": [{
                 "cabecalho": {
-                    "codigo_cliente_omie": omie_client.get("codigo_cliente_omie"),
-                    "codigo_cenario_impostos": self.OMIE_CENARIO_IMPOSTOS,
-                    "etapa": "10"  # Faturamento
+
+                    # Código do cliente cadastrado no Omie.
+                    "codigo_cliente_omie": (
+                        omie_client.get(
+                            "codigo_cliente_omie"
+                        )
+                    ),
+
+                    # Identificador do pedido no Odoo.
+                    #
+                    # NÃO utilizar numero_pedido como número da NF.
+                    "codigo_pedido_integracao": (
+                        codigo_integracao
+                    ),
+
+                    # Etapa do Pedido de Venda.
+                    #
+                    # MOLDE:
+                    # confirmar conforme parametrização do Omie.
+                    "etapa": "10",
+
+                    "quantidade_itens": 1
                 },
+
                 "frete": {
-                    "modalidade_frete": "0",  # 0 = CIF (Remetente/Acomodado)
+
+                    # MOLDE:
+                    # Confirmar modalidade de frete utilizada no Omie.
+                    "modalidade_frete": "0",
+
                     "valor_frete": 0.00,
-                    "codigo_trasportadora": str(self.carrier_id.id)
+
+                    "quantidade_volumes": qtd_faturar,
+
+                    "especie_volumes": "CAIXA",
+
+                    "peso_bruto": peso_total,
+
+                    "peso_liquido": peso_total
                 },
-                "det": itens_payload
+
+                "det": itens_payload,
+
+                "informacoes_adicionais": {
+
+                    "dados_adicionais_nf": (
+                        "Origem: Internacional. "
+                        "Operacao de Remessa em Comodato."
+                    )
+                }
             }]
         }
 
-        # 6. REQUISIÇÃO HTTP PARA A API DO OMIE
-        url = "https://app.omie.com.br/api/v1/produtos/pedido/"
-        headers = {"Content-Type": "application/json"}
+        # =====================================================================
+        # REQUISIÇÃO HTTP - CRIA PEDIDO
+        # =====================================================================
+
+        url = (
+            "https://app.omie.com.br/"
+            "api/v1/produtos/pedido/"
+        )
+
+        headers = {
+            "Content-Type": "application/json"
+        }
 
         try:
-            response = requests.post(url, data=json.dumps(payload), headers=headers, timeout=30)
-            res_data = response.json()
-        except requests.exceptions.RequestException as e:
-            raise exceptions.UserError(f"Falha de conexão com a API do Omie: {e}")
 
-        # 7. TRATAMENTO DA RESPOSTA E ATUALIZAÇÃO DOS CAMPOS
-        if response.status_code == 200 and "numero_pedido" in res_data:
-            numero_nf = str(res_data.get("numero_pedido"))
-            codigo_pedido = res_data.get("codigo_pedido")
+            response = requests.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=30
+            )
+
+            response.raise_for_status()
+
+            res_data = response.json()
+
+        except requests.exceptions.RequestException as e:
+
+            raise exceptions.UserError(
+                "Falha de conexão com a API do Omie "
+                "ao criar o Pedido de Venda:\n\n"
+                f"{e}"
+            )
+
+        # =====================================================================
+        # TRATAMENTO DA RESPOSTA
+        # =====================================================================
+
+        if res_data.get("faultstring"):
+
+            raise exceptions.UserError(
+                "Erro ao criar o Pedido de Venda no Omie:\n\n"
+                f"{res_data.get('faultstring')}"
+            )
+
+        codigo_pedido = (
+            res_data.get("codigo_pedido")
+        )
+
+        numero_pedido = (
+            res_data.get("numero_pedido")
+        )
+
+        if not codigo_pedido:
+
+            raise exceptions.UserError(
+                "O Omie não retornou o código "
+                "do Pedido de Venda.\n\n"
+                f"Retorno recebido:\n{res_data}"
+            )
+
+        # =====================================================================
+        # ATUALIZA STATUS NO ODOO
+        # =====================================================================
+        #
+        # IMPORTANTE:
+        # Aqui NÃO gravamos numero_pedido como numero_nota_fiscal.
+        #
+        # O número recebido é o número do Pedido de Venda.
+        #
+
+        self.write({
+            "omie_nfe_status": (
+                "PEDIDO_CRIADO - "
+                f"Pedido Omie: "
+                f"{numero_pedido or codigo_pedido}"
+            )
+        })
+
+        # =====================================================================
+        # RETORNO DO PEDIDO
+        # =====================================================================
+
+        return {
+            "codigo_pedido": codigo_pedido,
+
+            "numero_pedido": numero_pedido,
+
+            "codigo_pedido_integracao": (
+                codigo_integracao
+            )
+        }
+
+    # =========================================================================
+    # MÉTODO AUXILIAR
+    # FATURAMENTO DO PEDIDO DE VENDA / EMISSÃO DA NF-e
+    # =========================================================================
+
+    def _faturar_pedido_venda_omie(
+        self,
+        pedido_omie
+    ):
+        """
+        Solicita ao Omie o faturamento do Pedido de Venda.
+
+        Fluxo:
+
+            Pedido de Venda
+                  ↓
+            FaturarPedidoVenda
+                  ↓
+            Processamento NF-e
+                  ↓
+                SEFAZ
+                  ↓
+            Autorizada/Rejeitada
+
+        IMPORTANTE:
+        O retorno desta chamada NÃO deve ser tratado automaticamente
+        como NF-e autorizada.
+
+        A autorização final deverá ser confirmada posteriormente
+        através de webhook ou consulta da NF-e.
+        """
+
+        # =====================================================================
+        # ENDPOINT DE FATURAMENTO
+        # =====================================================================
+
+        url = (
+            "https://app.omie.com.br/"
+            "api/v1/produtos/pedidovendafat/"
+        )
+
+        # =====================================================================
+        # PAYLOAD
+        # =====================================================================
+
+        payload = {
+            "call": "FaturarPedidoVenda",
+
+            "app_key": self.OMIE_APP_KEY,
+
+            "app_secret": self.OMIE_APP_SECRET,
+
+            "param": [{
+
+                # Código interno do Pedido de Venda no Omie.
+                "nCodPed": (
+                    pedido_omie[
+                        "codigo_pedido"
+                    ]
+                ),
+
+                # Identificador utilizado pela integração.
+                "cCodIntPed": (
+                    pedido_omie[
+                        "codigo_pedido_integracao"
+                    ]
+                )
+            }]
+        }
+
+        headers = {
+            "Content-Type": "application/json"
+        }
+
+        # =====================================================================
+        # REQUISIÇÃO HTTP
+        # =====================================================================
+
+        try:
+
+            response = requests.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=30
+            )
+
+            response.raise_for_status()
+
+            res_data = response.json()
+
+        except requests.exceptions.RequestException as e:
 
             self.write({
-                'numero_nota_fiscal': numero_nf,
-                'data_envio': fields.Datetime.now(),
-                'custo_frete': 0.00,
-                'omie_nfe_status': f"Sucesso! Pedido OMIE ID: {codigo_pedido}"
+                "omie_nfe_status": (
+                    "ERRO_FATURAMENTO"
+                )
             })
-        else:
-            erro_msg = res_data.get("faultstring", "Erro desconhecido retornado pela API do Omie.")
-            raise exceptions.UserError(f"Erro ao emitir NF-e no Omie:\n{erro_msg}")
+
+            raise exceptions.UserError(
+                "Falha de conexão com a API do Omie "
+                "ao solicitar o faturamento:\n\n"
+                f"{e}"
+            )
+
+        # =====================================================================
+        # ERRO RETORNADO PELO OMIE
+        # =====================================================================
+
+        if res_data.get("faultstring"):
+
+            self.write({
+                "omie_nfe_status": (
+                    "ERRO_FATURAMENTO"
+                )
+            })
+
+            raise exceptions.UserError(
+                "O Omie não conseguiu faturar "
+                "o Pedido de Venda:\n\n"
+                f"{res_data.get('faultstring')}"
+            )
+
+        # =====================================================================
+        # STATUS DO FATURAMENTO
+        # =====================================================================
+
+        codigo_status = (
+            res_data.get("cCodStatus")
+        )
+
+        descricao_status = (
+            res_data.get("cDescStatus")
+        )
+
+        # MOLDE:
+        # Os códigos exatos de sucesso/erro devem ser confirmados
+        # conforme o método da API utilizado no ambiente Omie.
+
+        if codigo_status and codigo_status not in (
+            "0",
+            "100"
+        ):
+
+            self.write({
+                "omie_nfe_status": (
+                    "ERRO_FATURAMENTO - "
+                    f"{codigo_status}: "
+                    f"{descricao_status}"
+                )
+            })
+
+            raise exceptions.UserError(
+                "O Omie retornou erro ao faturar "
+                "o Pedido de Venda:\n\n"
+                f"Código: {codigo_status}\n"
+                f"Descrição: {descricao_status}"
+            )
+
+        # =====================================================================
+        # STATUS NO ODOO
+        # =====================================================================
+        #
+        # Neste ponto:
+        #
+        # Pedido criado       = SIM
+        # Faturamento enviado = SIM
+        # NF-e autorizada     = AINDA NÃO NECESSARIAMENTE
+        #
+        # Por isso NÃO preenchemos numero_nota_fiscal aqui.
+        #
+
+        self.write({
+            "omie_nfe_status": (
+                "FATURAMENTO_SOLICITADO - "
+                "Aguardando processamento "
+                "da NF-e/SEFAZ"
+            ),
+
+            "shipping_date": fields.Datetime.now(),
+
+            "custo_frete": 0.00
+        })
+
+        return res_data
 
     # =========================================================================
-    # MÉTODOS AUXILIARES DE SUPORTE
+    # MÉTODO AUXILIAR
+    # CONSULTA CLIENTE NO OMIE
     # =========================================================================
-    def _consultar_cliente_omie(self, cnpj_cpf):
-        """Consulta o cadastro do cliente via API do Omie usando o CNPJ/CPF."""
-        url = "https://app.omie.com.br/api/v1/geral/clientes/"
+
+    def _consultar_cliente_omie(
+        self,
+        cnpj_cpf
+    ):
+        url = (
+            "https://app.omie.com.br/"
+            "api/v1/geral/clientes/"
+        )
+
         payload = {
             "call": "PesquisarClientes",
+
             "app_key": self.OMIE_APP_KEY,
+
             "app_secret": self.OMIE_APP_SECRET,
+
             "param": [{
                 "clientesFiltro": {
                     "cnpj_cpf": cnpj_cpf
                 }
             }]
         }
-        headers = {"Content-Type": "application/json"}
 
         try:
-            res = requests.post(url, data=json.dumps(payload), headers=headers, timeout=15)
+
+            res = requests.post(
+                url,
+                json=payload,
+                timeout=15
+            )
+
             if res.status_code == 200:
-                data = res.json()
-                clientes = data.get("clientes_cadastro", [])
-                return clientes[0] if clientes else None
+
+                clientes = res.json().get(
+                    "clientes_cadastro",
+                    []
+                )
+
+                return (
+                    clientes[0]
+                    if clientes
+                    else None
+                )
+
         except requests.exceptions.RequestException:
             pass
 
         return None
 
-    def _validar_endereco_omie(self, omie_client):
-        """Compara o CEP e logradouro do Odoo com o cadastro retornado do Omie."""
-        cep_odoo = re.sub(r"\D", "", self.partner_id.zip or "")
-        cep_omie = re.sub(r"\D", "", omie_client.get("cep", ""))
+    # =========================================================================
+    # MÉTODO AUXILIAR
+    # VALIDA ENDEREÇO ODOO X OMIE
+    # =========================================================================
 
-        rua_odoo = (self.partner_id.street or "").strip().lower()
-        rua_omie = (omie_client.get("endereco", "")).strip().lower()
+    def _validar_endereco_omie(
+        self,
+        omie_client
+    ):
 
-        if cep_odoo != cep_omie or (rua_odoo not in rua_omie and rua_omie not in rua_odoo):
-            raise exceptions.UserError(
-                "Os dados de endereço no Odoo não coincidem com o cadastro ativo no OMIE!\n\n"
-                f"• Endereço Odoo: {self.partner_id.street}, CEP: {self.partner_id.zip}\n"
-                f"• Endereço OMIE: {omie_client.get('endereco')}, CEP: {omie_client.get('cep')}\n\n"
-                "Por favor, atualize o cadastro SEDE/LOCAL no OMIE antes de prosseguir."
+        cep_odoo = re.sub(
+            r"\D",
+            "",
+            self.partner_id.zip or ""
+        )
+
+        cep_omie = re.sub(
+            r"\D",
+            "",
+            omie_client.get(
+                "cep",
+                ""
             )
+        )
 
+        rua_odoo = (
+            self.partner_id.street or ""
+        ).strip().lower()
 
-# =============================================================================
-# ESTRUTURA XML VIEW (Para inclusão na view do Odoo)
-# =============================================================================
-"""
-<xpath expr="//header" position="inside">
-    <button name="action_gerar_nfe_omie"
-            string="Gerar NF-e Omie"
-            type="object"
-            class="btn-primary"
-            invisible="not carrier_id"/>
-</xpath>
-"""
+        rua_omie = (
+            omie_client.get(
+                "endereco",
+                ""
+            )
+        ).strip().lower()
+
+        if (
+            cep_odoo != cep_omie
+            or (
+                rua_odoo not in rua_omie
+                and rua_omie not in rua_odoo
+            )
+        ):
+
+            raise exceptions.UserError(
+                "Os dados de endereço no Odoo "
+                "não coincidem com o cadastro ativo no OMIE!\n\n"
+
+                f"• Endereço Odoo: "
+                f"{self.partner_id.street}, "
+                f"CEP: {self.partner_id.zip}\n"
+
+                f"• Endereço OMIE: "
+                f"{omie_client.get('endereco')}, "
+                f"CEP: {omie_client.get('cep')}\n\n"
+
+                "Por favor, atualize o cadastro "
+                "SEDE/LOCAL no OMIE antes de prosseguir."
+            )
